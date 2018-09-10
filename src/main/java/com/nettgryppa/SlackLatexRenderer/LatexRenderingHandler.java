@@ -16,6 +16,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -30,7 +31,6 @@ import org.apache.http.HttpHeaders;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.ClientProtocolException;
 import org.apache.http.client.HttpClient;
-import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.HttpClients;
@@ -40,12 +40,17 @@ import org.scilab.forge.jlatexmath.TeXConstants;
 import org.scilab.forge.jlatexmath.TeXFormula;
 import org.scilab.forge.jlatexmath.TeXIcon;
 
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
+import com.amazonaws.services.dynamodbv2.model.AttributeValue;
+import com.amazonaws.services.dynamodbv2.model.ConditionalCheckFailedException;
+import com.amazonaws.services.dynamodbv2.model.ExpectedAttributeValue;
+import com.amazonaws.services.dynamodbv2.model.PutItemRequest;
 import com.amazonaws.services.lambda.AWSLambda;
 import com.amazonaws.services.lambda.AWSLambdaClientBuilder;
 import com.amazonaws.services.lambda.model.InvocationType;
 import com.amazonaws.services.lambda.model.InvokeRequest;
 import com.amazonaws.services.lambda.runtime.Context;
-import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
@@ -59,12 +64,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 @SuppressWarnings({ "rawtypes", "unchecked" })
 public class LatexRenderingHandler implements RequestHandler<Map, ChallengeResponse> {
     private static final Logger LOG = LogManager.getLogger(LatexRenderingHandler.class);
-//    private static final String CLIENT_ID = System.getenv("CLIENT_ID");
-//    private static final String CLIENT_SECRET = System.getenv("CLIENT_SECRET");
     private static final String VERIFICATION_TOKEN = System.getenv("SLACK_TOKEN");
     private static final String OAUTH_TOKEN = System.getenv("OAUTH_TOKEN");
     private static final String S3_REGION = getEnvDefault("S3_REGION", "AWS_REGION");
+    private static final String LOCK_TABLE = System.getenv("LOCK_TABLE");
     private static final AmazonS3 s3 = AmazonS3ClientBuilder.standard().withRegion(S3_REGION).build();
+    private static final AmazonDynamoDB ddb = AmazonDynamoDBClientBuilder.standard().withRegion(S3_REGION).build();
     private static final String BUCKET = System.getenv("BUCKET");
     private static final ExecutorService THREAD_POOL = Executors.newFixedThreadPool(10);
     private static final Pattern MATH_PATTERN = Pattern.compile("\\$\\$([^$]+)\\$\\$");
@@ -129,8 +134,8 @@ public class LatexRenderingHandler implements RequestHandler<Map, ChallengeRespo
                     if (event2.containsKey("subtype")) {
                         return new ChallengeResponse("subtype");
                     }
-                    
-                    return new ChallengeResponse(parseMessage(event2));
+                    final String eventId = (String) input.get("event_id");
+                    return new ChallengeResponse(parseMessage(eventId, event2));
                 default:
                     return new ChallengeResponse("UNKNOWN");
             }
@@ -141,7 +146,8 @@ public class LatexRenderingHandler implements RequestHandler<Map, ChallengeRespo
         }
     }
 
-    private String parseMessage(Map tree) throws ClientProtocolException, IOException {
+    private String parseMessage(final String eventId, Map tree) throws ClientProtocolException, IOException {
+        final String myId = UUID.randomUUID().toString();
         final String channel = (String) tree.get("channel");
         final String user = (String) tree.get("user");
         final String text = (String) tree.get("text");
@@ -155,7 +161,13 @@ public class LatexRenderingHandler implements RequestHandler<Map, ChallengeRespo
             throw new RuntimeException(ex);
         }
         LinkedHashMap<String, Future<Boolean>> images = new LinkedHashMap<>();
+        boolean lockClaimed = false;
         while (matcher.find()) {
+            if (!lockClaimed && !claimLock(myId, eventId)) {
+                return "DEDUPE";
+            } else {
+                lockClaimed = true;
+            }
             final String formula = matcher.group(1);
             // formulae.add(formula);
             final String hash = Hex.encodeHexString(sha256.digest(formula.getBytes(StandardCharsets.UTF_8)))
@@ -247,5 +259,19 @@ public class LatexRenderingHandler implements RequestHandler<Map, ChallengeRespo
         HttpResponse response = client.execute(post);
         InputStream content = response.getEntity().getContent();
         System.out.println("SLACK Conent: " + IOUtils.toString(content));
+    }
+
+    private static boolean claimLock(final String clientId, final String eventId) {
+        try {
+        ddb.putItem(new PutItemRequest()
+            .withTableName(LOCK_TABLE)
+            .addItemEntry("EventId", new AttributeValue().withS(eventId))
+            .addItemEntry("ClientId", new AttributeValue().withS(clientId))
+            .addItemEntry("Expiration", new AttributeValue().withN(Long.toString((System.currentTimeMillis() + 300_000) / 1000)))
+            .addExpectedEntry("EventId", new ExpectedAttributeValue().withExists(false)));
+        } catch (final ConditionalCheckFailedException ex) {
+            return false;
+        }
+        return true;
     }
 }

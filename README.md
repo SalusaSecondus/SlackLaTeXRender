@@ -11,7 +11,11 @@ This uses Maven so you should just be able to run `mvn package` in the root of t
 1. Ensure you have a working AWS account
 2. Select an AWS region (all further work is done in this region)
 3. Create an S3 bucket in that region. (No special permissions are needed.)
-4. Create a Lambda function
+4. Create a DynamoDB Table with the following properties. Make a note of the table ARN.
+    1. Primary partition key: EventId (String)
+    2. Time to live attribute (must be set after creation: Expiration
+    3. Capacity: 2/2 (you can always raise it later if you need to)
+5. Create a Lambda function
     1. Author from Scratch
         * Name = Whatever you like
         * Runtime = Java 8
@@ -28,7 +32,7 @@ This uses Maven so you should just be able to run `mvn package` in the root of t
         * Security = Open
         * ADD
         * Make a note of the API Endpoint (it's a URL)
-5. Go to the IAM console and load the role you created earlier
+6. Go to the IAM console and load the role you created earlier
     1. Substituting your bucket for `$BUCKET` and the function arn for `$LAMBDA_ARN`, add the following policy:
         ```
         {
@@ -71,6 +75,16 @@ This uses Maven so you should just be able to run `mvn package` in the root of t
                   "lambda:InvokeAsync"
                 ],
                 "Resource": "$LAMBDA_ARN"
+              },
+	      {
+                "Sid": "AccessLockTable",
+                "Effect": "Allow",
+                "Action": [
+                  "dynamodb:PutItem",
+                  "dynamodb:GetItem",
+                  "dynamodb:UpdateItem"
+                ],
+                "Resource": "$DYNAMO_TABLE_ARN"
               }
             ]
         }
@@ -107,6 +121,3 @@ Return to Slack and under "Event Subscriptions" have it verify the endpoint
 Figure out how to get it into your channels and it will respond to any LaTeX mathematic expression between two equals signs:
     $$\sum_{x=1}^{n} = \frac{n(n+1)}{2}$$
     
-
-## Bugs
-Due to cold-start problems this will multi-post when it hasn't been used in a while.
